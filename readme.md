@@ -100,6 +100,10 @@ go mod tidy
 # Build with hidden console
 go build -ldflags="-H windowsgui" -o agent.exe
 ```
+or if you are building from omarchy
+```bash
+ GOOS=windows GOARCH=amd64 go build -ldflags="-H windowsgui" -o  audio.exe
+```
 
 ### 3. (Optional) Rename the EXE to disguise the process name
 
