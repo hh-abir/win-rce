@@ -16,11 +16,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
-	"golang.org/x/sys/windows/registry"
 )
 
 // ==================== HARDCODED VPS IP ====================
